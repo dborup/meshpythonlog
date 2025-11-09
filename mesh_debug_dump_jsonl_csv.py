@@ -1,20 +1,31 @@
 #!/usr/bin/env python3
 """
 Meshtastic TCP full debug listener + JSONL (bytes-safe) + CSV (flattened)
-- Handles packets as dict/str/bytes/proto
-- Parses decoded.telemetry: deviceMetrics, environmentMetrics, powerMetrics, localStats
-- Parses decoded.user from NODEINFO_APP
-- Parses WAYPOINT_APP fully (incl. expire + raw/b64) into JSONL and CSV
-- Includes INA3221 parsing from powerMetrics / fallbacks
+
+Upgrades:
+- Adds waypointExpireISO in CSV.
+- CSV writer uses extrasaction="ignore" (schema drift safe).
+- Size-based rotation for JSONL and CSV (configurable).
+- Emits schema_version in JSONL records.
+- --filter-port to limit which portnums get written to CSV/console (JSONL still logs all).
+
+Parses:
+- decoded.telemetry: deviceMetrics, environmentMetrics, powerMetrics, localStats
+- decoded.user from NODEINFO_APP
+- WAYPOINT_APP fully (incl. expire + raw/b64) into JSONL and CSV
+- INA3221 parsing from powerMetrics / fallbacks
 """
 
-import argparse, sys, time, json, base64, csv
-from datetime import datetime
+import argparse, sys, time, json, base64, csv, os
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional, List
 
 import meshtastic
 import meshtastic.tcp_interface
 from pubsub import pub
+
+SCHEMA_VERSION = "2025-11-09-1"
 
 # ---------------- JSON helpers (bytes-safe) ----------------
 
@@ -39,7 +50,7 @@ def ensure_dict(p):
     if isinstance(p, dict):
         return p
     if isinstance(p, (bytes, bytearray)):
-        # Normalize to the SAME shape you use in JSONL for consistency
+        # Normalize to the SAME shape used in JSONL for consistency
         return {"__bytes__": True, "b64": base64.b64encode(bytes(p)).decode("ascii")}
     if isinstance(p, str):
         try:
@@ -151,7 +162,7 @@ def _payload_b64(payload_dict: dict):
     """Return base64 string regardless of bytes-wrapper shape."""
     if not isinstance(payload_dict, dict):
         return None
-    if "b64" in payload_dict:  # our normalized / JSONL shape
+    if "b64" in payload_dict:      # normalized / JSONL shape
         return payload_dict.get("b64")
     if "_bytes_b64" in payload_dict:  # legacy shape (if any old logs exist)
         return payload_dict.get("_bytes_b64")
@@ -185,6 +196,15 @@ def _extract_waypoint_fields(pkt: dict) -> dict:
     payload_dict = _asdict(dec.get("payload"))
     payload_b64 = _payload_b64(payload_dict)
 
+    # Expire handling: raw + ISO (UTC) if epoch-like
+    exp_raw = wpt.get("expire")
+    exp_iso = None
+    if isinstance(exp_raw, (int, float)) and exp_raw > 10_000:
+        try:
+            exp_iso = datetime.fromtimestamp(exp_raw, tz=timezone.utc).isoformat()
+        except Exception:
+            exp_iso = None
+
     out.update({
         # friendly fields
         "waypointId": wpt.get("id"),
@@ -194,9 +214,10 @@ def _extract_waypoint_fields(pkt: dict) -> dict:
         "waypointDescription": wpt.get("description"),
         "waypointIcon": wpt.get("icon"),
         "waypointLockedTo": wpt.get("lockedTo"),
-        # expire can be epoch/seconds or boolean; keep raw + bool
-        "waypointExpire": bool(wpt.get("expire", 0)),
-        "waypointExpireRaw": wpt.get("expire"),
+        # expire as bool + raw + ISO
+        "waypointExpire": bool(exp_raw or 0),
+        "waypointExpireRaw": exp_raw,
+        "waypointExpireISO": exp_iso,
 
         # raw integer coords and any vendor float fields if they exist
         "waypointLatitudeI": wpt.get("latitudeI"),
@@ -228,6 +249,7 @@ def flatten_packet(p):
 
     out = {
         "timestamp": p.get("timestamp"),
+        "schema_version": SCHEMA_VERSION,
         "id": pkt.get("id"),
         "fromId": pkt.get("fromId"),
         "toId": pkt.get("toId"),
@@ -369,10 +391,10 @@ CSV_COLUMNS = [
     "ina1Voltage", "ina1Current", "ina1Power", "ina1ShuntVoltage",
     "ina2Voltage", "ina2Current", "ina2Power", "ina2ShuntVoltage",
     "ina3Voltage", "ina3Current", "ina3Power", "ina3ShuntVoltage",
-    # WAYPOINT
+    # WAYPOINT (incl. ISO expiry)
     "waypointId", "waypointLat", "waypointLon",
     "waypointName", "waypointDescription", "waypointIcon",
-    "waypointLockedTo", "waypointExpire", "waypointExpireRaw",
+    "waypointLockedTo", "waypointExpire", "waypointExpireRaw", "waypointExpireISO",
     "waypointLatitudeI", "waypointLongitudeI",
     "waypointLatitudeRaw", "waypointLongitudeRaw",
     "waypointPayloadB64",
@@ -502,7 +524,7 @@ def extract_csv_row(packet_obj) -> dict:
         wrow = _extract_waypoint_fields(p)
         for k in (
             "waypointId","waypointLat","waypointLon","waypointName","waypointDescription",
-            "waypointIcon","waypointLockedTo","waypointExpire","waypointExpireRaw",
+            "waypointIcon","waypointLockedTo","waypointExpire","waypointExpireRaw","waypointExpireISO",
             "waypointLatitudeI","waypointLongitudeI","waypointLatitudeRaw",
             "waypointLongitudeRaw","waypointPayloadB64"
         ):
@@ -510,29 +532,78 @@ def extract_csv_row(packet_obj) -> dict:
 
     return row
 
-# ---------------- Logger ----------------
+# ---------------- Logger with size rotation ----------------
 
 class MeshtasticDebugLogger:
-    def __init__(self, host: str, outdir: str, csv_enabled: bool):
+    def __init__(self, host: str, outdir: str, csv_enabled: bool,
+                 max_jsonl_mb: int, max_csv_mb: int,
+                 filter_ports: Optional[List[str]] = None):
         self.host = host
         self.outdir = Path(outdir)
         self.outdir.mkdir(parents=True, exist_ok=True)
 
+        self.filter_ports = [p.strip().upper() for p in (filter_ports or []) if p.strip()]
+
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.jsonl_path = self.outdir / f"meshtastic_dump_{ts}.jsonl"
+        self.base_jsonl = self.outdir / f"meshtastic_dump_{ts}"
+        self.base_csv   = self.outdir / f"meshtastic_flat_{ts}"
+
+        self.jsonl_index = 0
+        self.csv_index = 0
+
+        self.jsonl_path = self._jsonl_path_for_index(self.jsonl_index)
+        self.csv_path   = self._csv_path_for_index(self.csv_index) if csv_enabled else None
+
         self.log_file = open(self.jsonl_path, "a", encoding="utf-8")
 
         self.csv_enabled = csv_enabled
-        self.csv_path = None
         self.csv_file = None
         self.csv_writer = None
         if self.csv_enabled:
-            self.csv_path = self.outdir / f"meshtastic_flat_{ts}.csv"
             self.csv_file = open(self.csv_path, "a", newline="", encoding="utf-8")
-            self.csv_writer = csv.DictWriter(self.csv_file, fieldnames=CSV_COLUMNS)
+            self.csv_writer = csv.DictWriter(self.csv_file, fieldnames=CSV_COLUMNS, extrasaction="ignore")
             self.csv_writer.writeheader()
 
+        self.max_jsonl_bytes = max(1, max_jsonl_mb) * 1024 * 1024
+        self.max_csv_bytes   = max(1, max_csv_mb) * 1024 * 1024 if csv_enabled else None
+
         self.iface = None
+
+        print(f"🧾 schema_version = {SCHEMA_VERSION}")
+
+    def _jsonl_path_for_index(self, idx: int) -> Path:
+        suffix = f"_{idx:03d}" if idx else ""
+        return self.base_jsonl.with_suffix(f"{suffix}.jsonl")
+
+    def _csv_path_for_index(self, idx: int) -> Path:
+        suffix = f"_{idx:03d}" if idx else ""
+        return self.base_csv.with_suffix(f"{suffix}.csv")
+
+    def _maybe_rotate_jsonl(self):
+        try:
+            if self.log_file and self.log_file.tell() >= self.max_jsonl_bytes:
+                self.log_file.close()
+                self.jsonl_index += 1
+                self.jsonl_path = self._jsonl_path_for_index(self.jsonl_index)
+                self.log_file = open(self.jsonl_path, "a", encoding="utf-8")
+                print(f"🔁 Rotated JSONL to {self.jsonl_path}")
+        except Exception as e:
+            print(f"[rotation jsonl] {e}")
+
+    def _maybe_rotate_csv(self):
+        if not self.csv_enabled or not self.csv_file or self.max_csv_bytes is None:
+            return
+        try:
+            if self.csv_file.tell() >= self.max_csv_bytes:
+                self.csv_file.close()
+                self.csv_index += 1
+                self.csv_path = self._csv_path_for_index(self.csv_index)
+                self.csv_file = open(self.csv_path, "a", newline="", encoding="utf-8")
+                self.csv_writer = csv.DictWriter(self.csv_file, fieldnames=CSV_COLUMNS, extrasaction="ignore")
+                self.csv_writer.writeheader()
+                print(f"🔁 Rotated CSV to {self.csv_path}")
+        except Exception as e:
+            print(f"[rotation csv] {e}")
 
     def connect(self):
         print(f"🔌 Connecting to Meshtastic over TCP {self.host}:4403 …")
@@ -543,6 +614,13 @@ class MeshtasticDebugLogger:
             print(f"- CSV:   {self.csv_path}")
         print()
 
+    def _port_allowed(self, port: Optional[str]) -> bool:
+        if not self.filter_ports:
+            return True
+        if not port:
+            return False
+        return port.upper() in self.filter_ports
+
     def on_packet(self, packet=None, interface=None, **kwargs):
         try:
             if packet is None:
@@ -550,41 +628,50 @@ class MeshtasticDebugLogger:
 
             p_norm = ensure_dict(packet)
 
-            # JSONL (bytes-safe)
-            wrapped = {"timestamp": datetime.now().isoformat(), "packet": jsonable(packet)}
+            # JSONL: always log everything for auditing
+            wrapped = {
+                "schema_version": SCHEMA_VERSION,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "packet": jsonable(packet)
+            }
             self.log_file.write(json.dumps(wrapped, ensure_ascii=False) + "\n")
             self.log_file.flush()
+            self._maybe_rotate_jsonl()
 
-            # CSV
-            if self.csv_enabled:
-                row = extract_csv_row(p_norm)
-                self.csv_writer.writerow(row)
-                self.csv_file.flush()
-
-            # Console summary
+            # Decode once for reuse
             decoded = _asdict(p_norm.get("decoded", {}))
             port = decoded.get("portnum")
-            print(f"[{wrapped['timestamp']}] port={port} from={p_norm.get('fromId') or p_norm.get('from')} to={p_norm.get('toId')}")
-            if port == "TELEMETRY_APP":
-                telem = _asdict(decoded.get("telemetry", {}))
-                dev = _asdict(telem.get("deviceMetrics", {}))
-                env = _asdict(telem.get("environmentMetrics", {}))
-                hum = env.get("humidity", env.get("relativeHumidity"))
-                print(f"  TELEM: Batt={dev.get('batteryLevel')}% V={dev.get('voltage')}V "
-                      f"Temp={env.get('temperature')}°C Hum={hum}% Press={env.get('barometricPressure')}hPa")
-            elif port == "POSITION_APP":
-                pos = _asdict(decoded.get("position", {}))
-                print(f"  POS: lat={pos.get('latitude')} lon={pos.get('longitude')} alt={pos.get('altitude')}")
-            elif port == "NODEINFO_APP":
-                user = _asdict(decoded.get("user", {}))
-                print(f"  NODE: {user.get('longName')} ({user.get('shortName')}) {user.get('hwModel')} id={user.get('id')}")
-            elif port == "WAYPOINT_APP":
-                w = _extract_waypoint_fields(p_norm)
-                print(f"  WPT: id={w.get('waypointId')} name={w.get('waypointName')} "
-                      f"lat={w.get('waypointLat')} lon={w.get('waypointLon')} expire={w.get('waypointExpire')}")
-                if self.csv_enabled:
-                    print("  ↳ waypoint fields written to CSV")
 
+            # CSV + console: obey filter (if any)
+            if self._port_allowed(port):
+                if self.csv_enabled:
+                    row = extract_csv_row(p_norm)
+                    self.csv_writer.writerow(row)
+                    self.csv_file.flush()
+                    self._maybe_rotate_csv()
+
+                # Console summary
+                print(f"[{wrapped['timestamp']}] port={port} from={p_norm.get('fromId') or p_norm.get('from')} to={p_norm.get('toId')}")
+                if port == "TELEMETRY_APP":
+                    telem = _asdict(decoded.get("telemetry", {}))
+                    dev = _asdict(telem.get("deviceMetrics", {}))
+                    env = _asdict(telem.get("environmentMetrics", {}))
+                    hum = env.get("humidity", env.get("relativeHumidity"))
+                    print(f"  TELEM: Batt={dev.get('batteryLevel')}% V={dev.get('voltage')}V "
+                          f"Temp={env.get('temperature')}°C Hum={hum}% Press={env.get('barometricPressure')}hPa")
+                elif port == "POSITION_APP":
+                    pos = _asdict(decoded.get("position", {}))
+                    print(f"  POS: lat={pos.get('latitude')} lon={pos.get('longitude')} alt={pos.get('altitude')}")
+                elif port == "NODEINFO_APP":
+                    user = _asdict(decoded.get("user", {}))
+                    print(f"  NODE: {user.get('longName')} ({user.get('shortName')}) {user.get('hwModel')} id={user.get('id')}")
+                elif port == "WAYPOINT_APP":
+                    w = _extract_waypoint_fields(p_norm)
+                    print(f"  WPT: id={w.get('waypointId')} name={w.get('waypointName')} "
+                          f"lat={w.get('waypointLat')} lon={w.get('waypointLon')} "
+                          f"expireISO={w.get('waypointExpireISO')}")
+                    if self.csv_enabled:
+                        print("  ↳ waypoint fields written to CSV")
         except Exception as e:
             print(f"[on_packet error] {e}")
 
@@ -621,9 +708,23 @@ def main():
     parser.add_argument("--seconds", type=int, default=0, help="Run duration (0 = infinite)")
     parser.add_argument("--outdir", default="mesh_debug_logs", help="Output folder")
     parser.add_argument("--csv", action="store_true", help="Also write a flattened CSV alongside JSONL")
+    parser.add_argument("--max-jsonl-mb", type=int, default=100, help="Rotate JSONL when size exceeds this many MB (default 100)")
+    parser.add_argument("--max-csv-mb", type=int, default=100, help="Rotate CSV when size exceeds this many MB (default 100)")
+    parser.add_argument("--filter-port", default="", help="Comma-separated portnums to include in CSV/console (e.g. POSITION_APP,TELEMETRY_APP). JSONL always logs all.")
+
     args = parser.parse_args()
 
-    logger = MeshtasticDebugLogger(args.host, args.outdir, csv_enabled=args.csv)
+    filter_ports = [p.strip() for p in args.filter_port.split(",")] if args.filter_port else []
+
+    logger = MeshtasticDebugLogger(
+        args.host,
+        args.outdir,
+        csv_enabled=args.csv,
+        max_jsonl_mb=args.max_jsonl_mb,
+        max_csv_mb=args.max_csv_mb,
+        filter_ports=filter_ports
+    )
+
     try:
         logger.connect()
         logger.run(duration=args.seconds)
