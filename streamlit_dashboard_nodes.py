@@ -310,10 +310,7 @@ for i, node in enumerate(sorted(df["fromId"].unique())):
 
         # Device V
         devv_txt = "-" if devv is None else f"{devv:.3f} V"
-        devv_age = "" if devv_ts is None else f" · seen {pd.to_datetime(devv_ts)}"
         st.metric("Device V", devv_txt)
-        if devv_age:
-            st.caption(devv_age)
 
         # INA1 summary line
         iv_txt = "-" if iv is None else f"{iv:.3f}"
