@@ -312,22 +312,40 @@ for i, node in enumerate(sorted(df["fromId"].unique())):
         devv_txt = "-" if devv is None else f"{devv:.3f} V"
         st.metric("Device V", devv_txt)
 
+        # Hops away
+        hops, _ = latest_nonnull(g, "hopsTraversed")
+        if hops is None or pd.isna(hops):
+            hs, _ = latest_nonnull(g, "hopStart")
+            hl, _ = latest_nonnull(g, "hopLimit")
+            hops = (hs - hl) if (hs is not None and hl is not None) else None
+        hops_txt = "-" if hops is None or pd.isna(hops) else f"{int(hops)}"
+        st.metric("Hops away", hops_txt)
+
+        # Air / Channel utilization
+        au, _ = latest_nonnull(g, "airUtilTx")
+        cu, _ = latest_nonnull(g, "channelUtilization")
+        au_txt = "-" if au is None or pd.isna(au) else f"{au:.2f}%"
+        cu_txt = "-" if cu is None or pd.isna(cu) else f"{cu:.2f}%"
+        st.caption(f"Util: Air {au_txt} · Channel {cu_txt}")
+        
+
         # INA1 summary line
-        iv_txt = "-" if iv is None else f"{iv:.3f}"
-        ic_txt = "-" if ic is None else f"{ic:.3f}"
-        st.caption(f"INA1 V/A: {iv_txt} / {ic_txt}")
+        #iv_txt = "-" if iv is None else f"{iv:.3f}"
+        #ic_txt = "-" if ic is None else f"{ic:.3f}"
+        #st.caption(f"INA1 V/A: {iv_txt} / {ic_txt}")
 
         # INA2 summary line
-        iv2, iv2_ts = latest_nonnull(g, "ina2Voltage")
-        ic2, ic2_ts = latest_nonnull(g, "ina2Current")
-        iv2_txt = "-" if iv2 is None else f"{iv2:.3f}"
-        ic2_txt = "-" if ic2 is None else f"{ic2:.3f}"
-        st.caption(f"INA2 V/A: {iv2_txt} / {ic2_txt}")
+        #iv2, iv2_ts = latest_nonnull(g, "ina2Voltage")
+        #ic2, ic2_ts = latest_nonnull(g, "ina2Current")
+        #iv2_txt = "-" if iv2 is None else f"{iv2:.3f}"
+        #ic2_txt = "-" if ic2 is None else f"{ic2:.3f}"
+        #st.caption(f"INA2 V/A: {iv2_txt} / {ic2_txt}")
 
         # Radio
         rssi_txt = "-" if rssi is None else f"{rssi:.0f} dBm"
         snr_txt  = "-" if snr  is None else f"{snr:.1f} dB"
         st.caption(f"RSSI {rssi_txt}, SNR {snr_txt}")
+        
 # ---------------- Global Expand/Collapse toggle ----------------
 st.sidebar.markdown("---")
 expand_all = st.sidebar.checkbox("Expand all charts", value=False)
