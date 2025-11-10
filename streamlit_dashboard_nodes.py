@@ -13,6 +13,12 @@ import numpy as np
 DEFAULT_DIR = "mesh_debug_logs"
 JSONL_GLOB = "meshtastic_dump_*.jsonl"
 TARGET_NODES = ["!335d6d57", "!dcb05c16", "!11ac3107", "!0bfc8344"]
+NODE_NAMES = {
+    "!335d6d57": "Drastrup",
+    "!dcb05c16": "Øster-Alling",
+    "!11ac3107": "Skejby",
+    "!0bfc8344": "Skødstrup",
+}
 
 st.set_page_config(page_title="Meshtastic Node Dashboard (Merged)", layout="wide")
 st.title("📡 Meshtastic Node Dashboard — merged JSONL, filtered to 4 nodes")
@@ -205,6 +211,9 @@ if df.empty:
 
 # Time filter
 df = df[(df["timestamp"] >= start) & (df["timestamp"] <= end)]
+# Apply friendly names
+df["nodeName"] = df["fromId"].map(NODE_NAMES).fillna(df["fromId"])
+
 # Only telemetry rows for power-related charts (prevents sparse bins from going NaN)
 df_telem = df[df["portnum"] == "TELEMETRY_APP"].copy()
 
@@ -278,6 +287,7 @@ cards = st.columns(min(4, df["fromId"].nunique()))
 
 for i, node in enumerate(sorted(df["fromId"].unique())):
     g = df[df["fromId"] == node]
+    name = NODE_NAMES.get(node, node)
     batt, batt_ts = latest_nonnull(g, "batteryLevel")
     devv, devv_ts = latest_nonnull(g, "voltage")
     rssi, rssi_ts = latest_nonnull(g, "rxRssi")
@@ -287,7 +297,7 @@ for i, node in enumerate(sorted(df["fromId"].unique())):
     ip, ip_ts = latest_nonnull(g, "ina1Power")
 
     with cards[i % len(cards)]:
-        st.markdown(f"**{node}**")
+        st.markdown(f"**{name}**")
 
         # Battery
         batt_txt = "-" if batt is None else f"{batt:.0f}%"
@@ -330,14 +340,26 @@ def line_chart(df_in: pd.DataFrame, y: str, title: str, expanded=False):
 
     if y not in df_in.columns or df_in[y].isna().all():
         return
+
     data = downsample(df_in, [y], res) if do_downsample else df_in[["timestamp", "fromId", y]].dropna()
     if data.empty or y not in data.columns:
         return
-    fig = px.line(data, x="timestamp", y=y, color="fromId",
-                  title=f"{title}{'' if not do_downsample else f' (res={res})'}",
-                  labels={"fromId": "Node"})
+
+    # Apply friendly names
+    data["nodeName"] = data["fromId"].map(NODE_NAMES).fillna(data["fromId"])
+
+    fig = px.line(
+        data,
+        x="timestamp",
+        y=y,
+        color="nodeName",  # ← this is the fix
+        title=f"{title}{'' if not do_downsample else f' (res={res})'}",
+        labels={"nodeName": "Node"}
+    )
+
     with st.expander(title, expanded=expanded):
         st.plotly_chart(fig, use_container_width=True)
+
 
 st.header("Power & Battery")
 line_chart(df_telem, "batteryLevel", "Battery %", expanded=True)
@@ -374,5 +396,7 @@ preview_cols = [c for c in [
     "batteryLevel","voltage",
     "ina1Voltage","ina1Current","ina2Voltage","ina2Current","ina3Voltage","ina3Current",
 ] if c in df.columns]
+preview_cols.insert(1, "nodeName")
 st.dataframe(df.sort_values("timestamp")[preview_cols].tail(200), use_container_width=True)
+
 
