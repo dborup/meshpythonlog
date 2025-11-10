@@ -164,7 +164,8 @@ def load_merge_tail(paths: List[Path], total_tail: int) -> pd.DataFrame:
 
 with st.status(f"Merging {len(files)} files …", expanded=False):
     df = load_merge_tail(files, max_rows_total)
-        # Ensure numeric dtypes so downsampling keeps these columns
+
+    # Ensure numeric dtypes so downsampling keeps these columns
     for col in [
         "batteryLevel", "voltage",
         "channelUtilization", "airUtilTx",
@@ -176,6 +177,7 @@ with st.status(f"Merging {len(files)} files …", expanded=False):
     ]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
+
 
     # Derived hop metrics
 
@@ -203,6 +205,9 @@ if df.empty:
 
 # Time filter
 df = df[(df["timestamp"] >= start) & (df["timestamp"] <= end)]
+# Only telemetry rows for power-related charts (prevents sparse bins from going NaN)
+df_telem = df[df["portnum"] == "TELEMETRY_APP"].copy()
+
 if df.empty:
     st.info("No rows in the chosen time window for the target nodes.")
     st.stop()
@@ -216,19 +221,49 @@ def choose_freq(seconds: float) -> str:
     if seconds <= 7*24*3600: return "15min"
     return "1H"
 
-def downsample(df_in: pd.DataFrame, ycols: List[str], freq: str) -> pd.DataFrame:
-    needed = ["timestamp", "fromId"] + [c for c in ycols if c in df_in.columns]
-    work = df_in[needed].dropna(subset=["timestamp"]).copy()
-    if work.empty:
-        return work
-    work = work.set_index("timestamp")
-    agg = work.groupby([pd.Grouper(freq=freq), "fromId"]).mean(numeric_only=True)
-    return agg.reset_index()
+def downsample(df_in: pd.DataFrame, y_cols: list[str], freq: str) -> pd.DataFrame:
+    # Keep only needed columns, sort by time
+    cols = ["timestamp", "fromId"] + [c for c in y_cols if c in df_in.columns]
+    d = df_in[cols].dropna(subset=["timestamp"]).copy()
+    if d.empty:
+        return d
+
+    # ensure numeric so resample doesn't drop
+    for c in y_cols:
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+
+    d = d.sort_values("timestamp")
+
+    # resample per node
+    chunks = []
+    for nid, g in d.groupby("fromId"):
+        if g.empty:
+            continue
+        g = g.set_index("timestamp")
+        # resample only selected columns, by mean
+        agg = g[y_cols].resample(freq).mean()
+        agg["fromId"] = nid
+        agg = agg.reset_index()
+        chunks.append(agg)
+
+    if not chunks:
+        return pd.DataFrame(columns=["timestamp", "fromId"] + y_cols)
+
+    out = pd.concat(chunks, ignore_index=True)
+
+    # drop rows where *all* requested y-cols are NaN (keeps lines from disappearing)
+    if y_cols:
+        mask = out[y_cols].notna().any(axis=1)
+        out = out[mask]
+
+    return out
+
 
 window_seconds = (end - start).total_seconds() if pd.notna(start) and pd.notna(end) else 0
 res = choose_freq(window_seconds) if do_downsample else None
 
-# ---------------- KPIs ----------------
+
 # ---------------- KPIs (latest non-null per metric) ----------------
 st.subheader("Latest KPIs per target node")
 
@@ -284,10 +319,15 @@ for i, node in enumerate(sorted(df["fromId"].unique())):
         rssi_txt = "-" if rssi is None else f"{rssi:.0f} dBm"
         snr_txt  = "-" if snr  is None else f"{snr:.1f} dB"
         st.caption(f"RSSI {rssi_txt}, SNR {snr_txt}")
+# ---------------- Global Expand/Collapse toggle ----------------
+st.sidebar.markdown("---")
+expand_all = st.sidebar.checkbox("Expand all charts", value=False)
 
 
 # ---------------- Charts ----------------
 def line_chart(df_in: pd.DataFrame, y: str, title: str, expanded=False):
+    expanded = expanded or expand_all
+
     if y not in df_in.columns or df_in[y].isna().all():
         return
     data = downsample(df_in, [y], res) if do_downsample else df_in[["timestamp", "fromId", y]].dropna()
@@ -300,19 +340,20 @@ def line_chart(df_in: pd.DataFrame, y: str, title: str, expanded=False):
         st.plotly_chart(fig, use_container_width=True)
 
 st.header("Power & Battery")
-line_chart(df, "batteryLevel", "Battery %", expanded=True)
-line_chart(df, "voltage", "Device Voltage (V)")
+line_chart(df_telem, "batteryLevel", "Battery %", expanded=True)
+line_chart(df_telem, "voltage", "Device Voltage (V)")
 
 for ch in (1, 2, 3):
-    line_chart(df, f"ina{ch}Voltage", f"INA{ch} Voltage (V)")
-    line_chart(df, f"ina{ch}Current", f"INA{ch} Current (A)")
-    line_chart(df, f"ina{ch}Power",   f"INA{ch} Power (W)")
+    line_chart(df_telem, f"ina{ch}Voltage", f"INA{ch} Voltage (V)")
+    line_chart(df_telem, f"ina{ch}Current", f"INA{ch} Current (A)")
+    line_chart(df_telem, f"ina{ch}Power",   f"INA{ch} Power (W)")
 
 st.header("Radio")
-line_chart(df, "rxRssi", "RSSI (dBm)")
-line_chart(df, "rxSnr", "SNR (dB)")
-line_chart(df, "channelUtilization", "Channel Utilization")
-line_chart(df, "airUtilTx", "Air Util Tx")
+line_chart(df_telem, "rxRssi", "RSSI (dBm)")
+line_chart(df_telem, "rxSnr", "SNR (dB)")
+line_chart(df_telem, "channelUtilization", "Channel Utilization")
+line_chart(df_telem, "airUtilTx", "Air Util Tx")
+
 
 st.header("Hops")
 line_chart(df, "hopStart", "Hop Start (initial TTL)")
