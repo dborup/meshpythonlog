@@ -8,6 +8,8 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 import numpy as np
+import time
+
 
 # ---------------- Configuration ----------------
 DEFAULT_DIR = "mesh_debug_logs"
@@ -332,6 +334,13 @@ for i, node in enumerate(sorted(df["fromId"].unique())):
 # ---------------- Global Expand/Collapse toggle ----------------
 st.sidebar.markdown("---")
 expand_all = st.sidebar.checkbox("Expand all charts", value=False)
+# ---------------- Auto-refresh ----------------
+st.sidebar.markdown("---")
+autorefresh = st.sidebar.checkbox("Auto-refresh dashboard", value=True)
+refresh_interval = st.sidebar.number_input("Refresh interval (seconds)", 5, 600, 300)
+
+if autorefresh:
+    st.experimental_rerun() if time.time() % refresh_interval < 1 else None
 
 
 # ---------------- Charts ----------------
