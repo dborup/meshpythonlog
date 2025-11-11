@@ -27,8 +27,8 @@ NODE_NAMES = {
 ALARM_STORE = Path("alarm_rules.json")
 NOTIFY_STORE = Path("alarm_notify.json")
 
-st.set_page_config(page_title="Meshtastic Node Dashboard (Merged)", layout="wide")
-st.title("📡 Meshtastic Node Dashboard — merged JSONL, filtered to 4 nodes")
+st.set_page_config(page_title="Meshtastic Node Dashboard", layout="wide")
+st.title("🗼SkyMesh Meshtastic Node Dashboard")
 
 # ---------------- Sidebar ----------------
 st.sidebar.header("Source")
@@ -477,8 +477,6 @@ if page == "Dashboard":
         else:
             uptime_txt = "❓ No data"
 
-        # (moved into the card below)
-
         hops, _ = latest_nonnull(g, "hopsTraversed")
         if hops is None or pd.isna(hops):
             hs, _ = latest_nonnull(g, "hopStart")
@@ -487,8 +485,6 @@ if page == "Dashboard":
 
         with cards[i % len(cards)]:
             st.markdown(f"**{name}** {uptime_txt.split()[0]}")
-
-            # Uptime line now LIVES INSIDE the card
             st.caption(" ".join(uptime_txt.split()[1:]) or uptime_txt)
 
             batt_txt = "-" if batt is None else f"{batt:.0f}%"
