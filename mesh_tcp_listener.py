@@ -1,0 +1,723 @@
+#!/usr/bin/env python3
+"""
+Meshtastic TCP full debug listener + JSONL (bytes-safe) + CSV (flattened)
+python3 mesh_tcp_listener.py --host 192.168.1.50 --csv --rotate-daily --daily-local --max-jsonl-mb 200 --max-csv-mb 200
+python3 mesh_tcp_listener.py --host 192.168.1.50 --csv --rotate-daily
+
+New:
+- --rotate-daily: rotate files when the date changes (UTC by default).
+- --daily-local: use local time for --rotate-daily (else UTC).
+- Daily and size rotation both active; either condition triggers a new file.
+- Base filenames include the current date when --rotate-daily is used.
+
+Existing:
+- UTC ISO timestamps for JSONL/CSV (unless you change daily to local).
+- Byte-accurate size rotation (os.path.getsize()).
+- CSV header only when file is empty (and after each rotation).
+- extrasaction="ignore" for schema drift.
+- --filter-port to limit CSV/console; JSONL always logs all.
+
+Parses:
+- TELEMETRY (device/environment/power/localStats)
+- NODEINFO_APP
+- WAYPOINT_APP (incl. expire ISO + raw payload b64)
+- INA3221 parsing (multiple shapes)
+"""
+
+import argparse, sys, time, json, base64, csv, os
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional, List
+
+import meshtastic
+import meshtastic.tcp_interface
+from pubsub import pub
+
+SCHEMA_VERSION = "2025-11-09-2"
+
+# ---------------- JSON helpers (bytes-safe) ----------------
+
+def jsonable(obj):
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
+    if isinstance(obj, (bytes, bytearray)):
+        return {"__bytes__": True, "b64": base64.b64encode(bytes(obj)).decode("ascii")}
+    if isinstance(obj, dict):
+        return {str(k): jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [jsonable(v) for v in obj]
+    if hasattr(obj, "__dict__"):
+        return jsonable(dict(obj.__dict__))
+    try:
+        return json.loads(json.dumps(obj, default=str))
+    except Exception:
+        return str(obj)
+
+def ensure_dict(p):
+    if isinstance(p, dict):
+        return p
+    if isinstance(p, (bytes, bytearray)):
+        return {"__bytes__": True, "b64": base64.b64encode(bytes(p)).decode("ascii")}
+    if isinstance(p, str):
+        try:
+            j = json.loads(p)
+            return j if isinstance(j, dict) else {"_str": p}
+        except Exception:
+            return {"_str": p}
+    if hasattr(p, "__dict__"):
+        return dict(p.__dict__)
+    return {"_repr": str(p)}
+
+def _asdict(x):
+    if isinstance(x, dict): return x
+    if hasattr(x, "__dict__"): return dict(x.__dict__)
+    if isinstance(x, str):
+        try:
+            j = json.loads(x)
+            return j if isinstance(j, dict) else {"_str": x}
+        except Exception:
+            return {"_str": x}
+    if isinstance(x, (bytes, bytearray)):
+        return {"__bytes__": True, "b64": base64.b64encode(bytes(x)).decode("ascii")}
+    try:
+        j = json.loads(json.dumps(x, default=str))
+        return j if isinstance(j, dict) else {"_repr": str(x)}
+    except Exception:
+        return {"_repr": str(x)}
+
+def _first_of_list_or_dict(x):
+    if isinstance(x, list) and x:
+        return _asdict(x[0])
+    return _asdict(x or {})
+
+# ---------------- Power / INA3221 helpers ----------------
+
+def _get_ina_field(d, *candidates):
+    for k in candidates:
+        if isinstance(d, dict) and k in d:
+            return d[k]
+    return None
+
+def parse_ina3221_from_pm(pm: dict) -> dict:
+    out = {
+        "ina1Voltage": None, "ina1Current": None, "ina1Power": None, "ina1ShuntVoltage": None,
+        "ina2Voltage": None, "ina2Current": None, "ina2Power": None, "ina2ShuntVoltage": None,
+        "ina3Voltage": None, "ina3Current": None, "ina3Power": None, "ina3ShuntVoltage": None,
+    }
+    if not isinstance(pm, dict):
+        return out
+
+    ina = pm.get("ina3221")
+
+    if isinstance(ina, dict):
+        ch1 = ina.get("ch1") or ina.get("channel1") or ina.get("1")
+        ch2 = ina.get("ch2") or ina.get("channel2") or ina.get("2")
+        ch3 = ina.get("ch3") or ina.get("channel3") or ina.get("3")
+        for idx, ch in ((1, ch1), (2, ch2), (3, ch3)):
+            if isinstance(ch, dict):
+                out[f"ina{idx}Voltage"]      = _get_ina_field(ch, "voltage", "busVoltage", "vBus", "v")
+                out[f"ina{idx}Current"]      = _get_ina_field(ch, "current", "iBus", "i")
+                out[f"ina{idx}Power"]        = _get_ina_field(ch, "power", "pBus", "p")
+                out[f"ina{idx}ShuntVoltage"] = _get_ina_field(ch, "shuntVoltage", "vShunt", "shunt")
+
+    if isinstance(ina, list):
+        for ch in ina:
+            if not isinstance(ch, dict):
+                continue
+            idx = ch.get("channel") or ch.get("ch") or ch.get("index")
+            if idx in (1, 2, 3):
+                out[f"ina{idx}Voltage"]      = out[f"ina{idx}Voltage"]      or _get_ina_field(ch, "voltage", "busVoltage", "vBus", "v")
+                out[f"ina{idx}Current"]      = out[f"ina{idx}Current"]      or _get_ina_field(ch, "current", "iBus", "i")
+                out[f"ina{idx}Power"]        = out[f"ina{idx}Power"]        or _get_ina_field(ch, "power", "pBus", "p")
+                out[f"ina{idx}ShuntVoltage"] = out[f"ina{idx}ShuntVoltage"] or _get_ina_field(ch, "shuntVoltage", "vShunt", "shunt")
+
+    for idx in (1, 2, 3):
+        out[f"ina{idx}Voltage"]      = out[f"ina{idx}Voltage"]      or pm.get(f"ina3221Ch{idx}Voltage") or pm.get(f"vBus{idx}")
+        out[f"ina{idx}Current"]      = out[f"ina{idx}Current"]      or pm.get(f"ina3221Ch{idx}Current") or pm.get(f"iBus{idx}")
+        out[f"ina{idx}Power"]        = out[f"ina{idx}Power"]        or pm.get(f"ina3221Ch{idx}Power")   or pm.get(f"pBus{idx}")
+        out[f"ina{idx}ShuntVoltage"] = out[f"ina{idx}ShuntVoltage"] or pm.get(f"shuntVoltage{idx}")     or pm.get(f"vShunt{idx}")
+
+    for idx in (1, 2, 3):
+        out[f"ina{idx}Voltage"] = out[f"ina{idx}Voltage"] or pm.get(f"ch{idx}Voltage")
+        out[f"ina{idx}Current"] = out[f"ina{idx}Current"] or pm.get(f"ch{idx}Current")
+
+    return out
+
+def parse_ina3221(decoded: dict) -> dict:
+    telem = _asdict(decoded.get("telemetry", {}))
+    pm = _asdict(telem.get("powerMetrics", {}))
+    if pm:
+        return parse_ina3221_from_pm(pm)
+    payload = _asdict(decoded.get("payload", {}))
+    pm = _asdict(payload.get("powerMetrics", {}))
+    if pm:
+        return parse_ina3221_from_pm(pm)
+    ina = payload.get("ina3221")
+    if isinstance(ina, (dict, list)):
+        return parse_ina3221_from_pm({"ina3221": ina})
+    return parse_ina3221_from_pm({})
+
+# ---------------- WAYPOINT helpers ----------------
+
+def _payload_b64(payload_dict: dict):
+    if not isinstance(payload_dict, dict):
+        return None
+    if "b64" in payload_dict:
+        return payload_dict.get("b64")
+    if "_bytes_b64" in payload_dict:
+        return payload_dict.get("_bytes_b64")
+    return None
+
+def _extract_waypoint_fields(pkt: dict) -> dict:
+    out = {}
+    dec = _asdict((pkt or {}).get("decoded", {}))
+    wpt = _asdict(dec.get("waypoint") or {})
+
+    lat = wpt.get("latitude")
+    if lat is None and "latitudeI" in wpt:
+        try: lat = wpt["latitudeI"] / 1e7
+        except Exception: lat = None
+
+    lon = wpt.get("longitude")
+    if lon is None and "longitudeI" in wpt:
+        try: lon = wpt["longitudeI"] / 1e7
+        except Exception: lon = None
+
+    payload_b64 = _payload_b64(_asdict(dec.get("payload")))
+
+    exp_raw = wpt.get("expire")
+    exp_iso = None
+    if isinstance(exp_raw, (int, float)) and exp_raw > 10_000:
+        try: exp_iso = datetime.fromtimestamp(exp_raw, tz=timezone.utc).isoformat()
+        except Exception: exp_iso = None
+
+    out.update({
+        "waypointId": wpt.get("id"),
+        "waypointLat": lat,
+        "waypointLon": lon,
+        "waypointName": wpt.get("name"),
+        "waypointDescription": wpt.get("description"),
+        "waypointIcon": wpt.get("icon"),
+        "waypointLockedTo": wpt.get("lockedTo"),
+        "waypointExpire": bool(exp_raw or 0),
+        "waypointExpireRaw": exp_raw,
+        "waypointExpireISO": exp_iso,
+        "waypointLatitudeI": wpt.get("latitudeI"),
+        "waypointLongitudeI": wpt.get("longitudeI"),
+        "waypointLatitudeRaw": wpt.get("latitude"),
+        "waypointLongitudeRaw": wpt.get("longitude"),
+        "waypointPayloadB64": payload_b64,
+        "portnum": dec.get("portnum"),
+        "fromId": pkt.get("fromId") or (pkt.get("from") if isinstance(pkt.get("from"), str) else None),
+        "toId": pkt.get("toId"),
+        "rxTime": pkt.get("rxTime") or _asdict(pkt.get("telemetry")).get("time"),
+        "rxSnr": pkt.get("rxSnr"),
+        "rxRssi": pkt.get("rxRssi"),
+        "hopLimit": pkt.get("hopLimit"),
+        "bitfield": dec.get("bitfield") or pkt.get("bitfield"),
+    })
+    return out
+
+# ---------------- High-level flattener ----------------
+
+def flatten_packet(p):
+    pkt = p.get("packet", {}) or {}
+    dec = pkt.get("decoded", {}) or {}
+    out = {
+        "timestamp": p.get("timestamp"),
+        "schema_version": SCHEMA_VERSION,
+        "id": pkt.get("id"),
+        "fromId": pkt.get("fromId"),
+        "toId": pkt.get("toId"),
+        "portnum": dec.get("portnum"),
+        "priority": pkt.get("priority"),
+        "rxTime": pkt.get("rxTime"),
+        "rxSnr": pkt.get("rxSnr"),
+        "rxRssi": pkt.get("rxRssi"),
+        "hopLimit": pkt.get("hopLimit"),
+        "hopStart": pkt.get("hopStart"),
+        "relayNode": pkt.get("relayNode"),
+        "channel": pkt.get("channel"),
+        "encrypted": pkt.get("encrypted"),
+    }
+
+    telem = dec.get("telemetry") or {}
+    pos   = dec.get("position") or {}
+    user  = dec.get("user") or {}
+    rout  = dec.get("routing") or {}
+
+    if dec.get("portnum") == "POSITION_APP" or pos:
+        lat = pos.get("latitude")
+        if lat is None and "latitudeI" in pos: lat = pos["latitudeI"] / 1e7
+        lon = pos.get("longitude")
+        if lon is None and "longitudeI" in pos: lon = pos["longitudeI"] / 1e7
+        out.update({
+            "latitude": lat, "longitude": lon, "altitude": pos.get("altitude"),
+            "positionTime": pos.get("time"), "locationSource": pos.get("locationSource"),
+            "PDOP": pos.get("PDOP"), "satsInView": pos.get("satsInView"),
+            "groundSpeed": pos.get("groundSpeed"), "groundTrack": pos.get("groundTrack"),
+            "precisionBits": pos.get("precisionBits"), "positionTimestamp": pos.get("timestamp"),
+        })
+
+    dm = (telem or {}).get("deviceMetrics") or {}
+    if dm:
+        out.update({
+            "batteryLevel": dm.get("batteryLevel"),
+            "pmVoltage": dm.get("voltage"),
+            "channelUtilization": dm.get("channelUtilization"),
+            "airUtilTx": dm.get("airUtilTx"),
+            "uptimeSeconds": dm.get("uptimeSeconds"),
+        })
+
+    em = (telem or {}).get("environmentMetrics") or {}
+    if em:
+        out.update({
+            "temperature": em.get("temperature"),
+            "relativeHumidity": em.get("relativeHumidity"),
+            "barometricPressure": em.get("barometricPressure"),
+            "gasResistance": em.get("gasResistance"),
+            "envVoltage": em.get("voltage"),
+            "envCurrent": em.get("current"),
+            "iaq": em.get("iaq"),
+        })
+
+    ls = (telem or {}).get("localStats") or {}
+    if ls:
+        out.update({
+            "numPacketsTx": ls.get("numPacketsTx"),
+            "numPacketsRx": ls.get("numPacketsRx"),
+            "numPacketsRxBad": ls.get("numPacketsRxBad"),
+            "numOnlineNodes": ls.get("numOnlineNodes"),
+            "numTotalNodes": ls.get("numTotalNodes"),
+            "numRxDupe": ls.get("numRxDupe"),
+            "numTxRelay": ls.get("numTxRelay"),
+            "numTxRelayCanceled": ls.get("numTxRelayCanceled"),
+            "heapTotalBytes": ls.get("heapTotalBytes"),
+            "heapFreeBytes": ls.get("heapFreeBytes"),
+            "uptimeSeconds_local": ls.get("uptimeSeconds"),
+            "channelUtilization_local": ls.get("channelUtilization"),
+            "airUtilTx_local": ls.get("airUtilTx"),
+        })
+
+    if user:
+        out.update({
+            "userId": user.get("id"),
+            "userLongName": user.get("longName"),
+            "userShortName": user.get("shortName"),
+            "macaddr": user.get("macaddr"),
+            "hwModel": user.get("hwModel"),
+            "publicKey": user.get("publicKey"),
+            "isUnmessagable": user.get("isUnmessagable"),
+        })
+
+    if dec.get("portnum") == "WAYPOINT_APP" or dec.get("waypoint"):
+        out.update(_extract_waypoint_fields(pkt))
+
+    if dec.get("portnum") == "ROUTING_APP" or rout:
+        out.update({
+            "routingRequestId": dec.get("requestId"),
+            "routingErrorReason": rout.get("errorReason"),
+            "isAck": (pkt.get("priority") == "ACK"),
+            "routingPayloadB64": _payload_b64(_asdict(dec.get("payload"))),
+        })
+
+    return out
+
+# ---------------- CSV schema ----------------
+
+CSV_COLUMNS = [
+    "timestamp", "id", "rxTime", "fromId", "fromNum", "toId", "portnum", "channel",
+    "hopStart", "hopLimit",
+    "rxSnr", "rxRssi",
+    "batteryLevel", "voltage", "airUtilTx", "channelUtilization", "uptimeSeconds",
+    "temperature", "humidity", "barometricPressure", "iaq", "co2", "gasResistance",
+    "pmVoltage", "pmCurrent",
+    "latitude", "longitude", "altitude", "time", "PDOP", "groundSpeed", "groundTrack",
+    "satsInView", "locationSource",
+    "text",
+    "numPacketsTx", "numPacketsRx", "numPacketsRxBad", "numOnlineNodes", "numTotalNodes",
+    "numRxDupe", "numTxRelay", "numTxRelayCanceled", "heapTotalBytes", "heapFreeBytes",
+    "userId", "userLongName", "userShortName", "hwModel", "macaddr", "publicKey",
+    "ina1Voltage", "ina1Current", "ina1Power", "ina1ShuntVoltage",
+    "ina2Voltage", "ina2Current", "ina2Power", "ina2ShuntVoltage",
+    "ina3Voltage", "ina3Current", "ina3Power", "ina3ShuntVoltage",
+    "waypointId", "waypointLat", "waypointLon",
+    "waypointName", "waypointDescription", "waypointIcon",
+    "waypointLockedTo", "waypointExpire", "waypointExpireRaw", "waypointExpireISO",
+    "waypointLatitudeI", "waypointLongitudeI",
+    "waypointLatitudeRaw", "waypointLongitudeRaw",
+    "waypointPayloadB64",
+    "routingRequestId", "routingErrorReason", "isAck", "routingPayloadB64",
+]
+
+# ---------------- Row extractor ----------------
+
+def extract_csv_row(packet_obj) -> dict:
+    p = ensure_dict(packet_obj)
+
+    decoded = _asdict(p.get("decoded", {}))
+    telem   = _asdict(decoded.get("telemetry", {}))
+    dev     = _asdict(telem.get("deviceMetrics", {}))
+    env     = _asdict(telem.get("environmentMetrics", {}))
+    pm      = _asdict(telem.get("powerMetrics", {}))
+    lstats  = _asdict(telem.get("localStats", {}))
+    user    = _asdict(decoded.get("user", {}))
+
+    payload = _asdict(decoded.get("payload", {}))
+    env2 = _asdict(payload.get("environmentMetrics", {}))
+    dev2 = _asdict(payload.get("deviceMetrics", {}))
+    pm2  = _asdict(payload.get("powerMetrics", {}))
+    if not env: env = env2
+    if not dev: dev = dev2
+    if not pm:  pm  = pm2
+
+    pos = _asdict(decoded.get("position", {}))
+
+    rxSnr  = p.get("rxSnr")
+    rxRssi = p.get("rxRssi")
+    if rxSnr is None or rxRssi is None:
+        rxm = _first_of_list_or_dict(p.get("rxMetadata"))
+        rxSnr  = rxSnr  if rxSnr  is not None else rxm.get("snr")
+        rxRssi = rxRssi if rxRssi is not None else rxm.get("rssi")
+
+    humidity = env.get("humidity", env.get("relativeHumidity"))
+    pmVoltage = pm.get("voltage")
+    pmCurrent = pm.get("current")
+
+    ina = parse_ina3221(decoded)
+
+    row = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "id": p.get("id"),
+        "rxTime": p.get("rxTime"),
+        "fromId": p.get("fromId"),
+        "fromNum": p.get("from"),
+        "toId": p.get("toId"),
+        "portnum": decoded.get("portnum"),
+        "channel": p.get("channel") or decoded.get("channel"),
+        "hopStart": p.get("hopStart"),
+        "hopLimit": p.get("hopLimit"),
+        "rxSnr": rxSnr,
+        "rxRssi": rxRssi,
+        "batteryLevel": dev.get("batteryLevel"),
+        "voltage": dev.get("voltage"),
+        "airUtilTx": dev.get("airUtilTx"),
+        "channelUtilization": dev.get("channelUtilization"),
+        "uptimeSeconds": dev.get("uptimeSeconds"),
+        "temperature": env.get("temperature"),
+        "humidity": humidity,
+        "barometricPressure": env.get("barometricPressure"),
+        "iaq": env.get("iaq"),
+        "co2": env.get("co2"),
+        "gasResistance": env.get("gasResistance"),
+        "pmVoltage": pmVoltage,
+        "pmCurrent": pmCurrent,
+        "latitude": pos.get("latitude"),
+        "longitude": pos.get("longitude"),
+        "altitude": pos.get("altitude"),
+        "time": pos.get("time"),
+        "PDOP": pos.get("PDOP"),
+        "groundSpeed": pos.get("groundSpeed"),
+        "groundTrack": pos.get("groundTrack"),
+        "satsInView": pos.get("satsInView"),
+        "locationSource": pos.get("locationSource"),
+        "text": decoded.get("text"),
+        "numPacketsTx": lstats.get("numPacketsTx"),
+        "numPacketsRx": lstats.get("numPacketsRx"),
+        "numPacketsRxBad": lstats.get("numPacketsRxBad"),
+        "numOnlineNodes": lstats.get("numOnlineNodes"),
+        "numTotalNodes": lstats.get("numTotalNodes"),
+        "numRxDupe": lstats.get("numRxDupe"),
+        "numTxRelay": lstats.get("numTxRelay"),
+        "numTxRelayCanceled": lstats.get("numTxRelayCanceled"),
+        "heapTotalBytes": lstats.get("heapTotalBytes"),
+        "heapFreeBytes": lstats.get("heapFreeBytes"),
+        "userId": user.get("id"),
+        "userLongName": user.get("longName"),
+        "userShortName": user.get("shortName"),
+        "hwModel": user.get("hwModel"),
+        "macaddr": user.get("macaddr"),
+        "publicKey": user.get("publicKey"),
+        **ina,
+    }
+
+    if decoded.get("portnum") == "WAYPOINT_APP" or decoded.get("waypoint"):
+        wrow = _extract_waypoint_fields(p)
+        for k in (
+            "waypointId","waypointLat","waypointLon","waypointName","waypointDescription",
+            "waypointIcon","waypointLockedTo","waypointExpire","waypointExpireRaw","waypointExpireISO",
+            "waypointLatitudeI","waypointLongitudeI","waypointLatitudeRaw",
+            "waypointLongitudeRaw","waypointPayloadB64"
+        ):
+            row[k] = wrow.get(k)
+
+    return row
+
+# ---------------- Logger (size + daily rotation) ----------------
+
+class MeshtasticDebugLogger:
+    def __init__(self, host: str, outdir: str, csv_enabled: bool,
+                 max_jsonl_mb: int, max_csv_mb: int,
+                 filter_ports: Optional[List[str]] = None,
+                 rotate_daily: bool = False, use_local_time: bool = False):
+        self.host = host
+        self.outdir = Path(outdir)
+        self.outdir.mkdir(parents=True, exist_ok=True)
+
+        self.filter_ports = [p.strip().upper() for p in (filter_ports or []) if p.strip()]
+        self.rotate_daily = rotate_daily
+        self.use_local_time = use_local_time
+
+        now = self._now()
+        self.current_date = now.strftime("%Y%m%d")
+
+        # Base names: if daily rotation, keep just the date in the base; else include full timestamp
+        if self.rotate_daily:
+            base_suffix = self.current_date
+        else:
+            base_suffix = now.strftime("%Y%m%d_%H%M%S")
+
+        self.base_jsonl = self.outdir / f"meshtastic_dump_{base_suffix}"
+        self.base_csv   = self.outdir / f"meshtastic_flat_{base_suffix}"
+
+        self.jsonl_index = 0
+        self.csv_index = 0
+
+        self.jsonl_path = self._jsonl_path_for_index(self.jsonl_index)
+        self.csv_path   = self._csv_path_for_index(self.csv_index) if csv_enabled else None
+
+        self.log_file = open(self.jsonl_path, "a", encoding="utf-8")
+
+        self.csv_enabled = csv_enabled
+        self.csv_file = None
+        self.csv_writer = None
+        if self.csv_enabled:
+            self._open_csv_file(initial=True)
+
+        self.max_jsonl_bytes = max(1, max_jsonl_mb) * 1024 * 1024
+        self.max_csv_bytes   = max(1, max_csv_mb) * 1024 * 1024 if csv_enabled else None
+
+        self.iface = None
+
+        print(f"🧾 schema_version = {SCHEMA_VERSION}")
+
+    def _now(self) -> datetime:
+        return datetime.now().astimezone() if self.use_local_time else datetime.now(timezone.utc)
+
+    def _date_str(self) -> str:
+        return self._now().strftime("%Y%m%d")
+
+    def _jsonl_path_for_index(self, idx: int) -> Path:
+        suffix = f"_{idx:03d}" if idx else ""
+        return self.base_jsonl.with_suffix(f"{suffix}.jsonl")
+
+    def _csv_path_for_index(self, idx: int) -> Path:
+        suffix = f"_{idx:03d}" if idx else ""
+        return self.base_csv.with_suffix(f"{suffix}.csv")
+
+    def _file_size(self, path: Path) -> int:
+        try:
+            return os.path.getsize(path)
+        except Exception:
+            return 0
+
+    def _open_csv_file(self, initial=False):
+        self.csv_file = open(self.csv_path, "a", newline="", encoding="utf-8")
+        self.csv_writer = csv.DictWriter(self.csv_file, fieldnames=CSV_COLUMNS, extrasaction="ignore")
+        if self._file_size(self.csv_path) == 0:
+            self.csv_writer.writeheader()
+        if initial:
+            print(f"- CSV:   {self.csv_path}")
+
+    # ----- rotation checks -----
+
+    def _maybe_rotate_daily_jsonl(self):
+        if not self.rotate_daily:
+            return
+        d = self._date_str()
+        if d != self.current_date:
+            # new day → reset base names to new date and index to 0
+            self.current_date = d
+            self.base_jsonl = self.outdir / f"meshtastic_dump_{self.current_date}"
+            self.jsonl_index = 0
+            self.log_file.close()
+            self.jsonl_path = self._jsonl_path_for_index(self.jsonl_index)
+            self.log_file = open(self.jsonl_path, "a", encoding="utf-8")
+            print(f"📅 Daily rotate JSONL → {self.jsonl_path}")
+
+    def _maybe_rotate_daily_csv(self):
+        if not (self.rotate_daily and self.csv_enabled):
+            return
+        d = self._date_str()
+        if d != self.current_date:
+            # base for CSV rotates along with JSONL
+            self.base_csv = self.outdir / f"meshtastic_flat_{d}"
+            self.csv_index = 0
+            if self.csv_file:
+                self.csv_file.close()
+            self.csv_path = self._csv_path_for_index(self.csv_index)
+            self._open_csv_file()
+            print(f"📅 Daily rotate CSV → {self.csv_path}")
+
+    def _maybe_rotate_jsonl_size(self):
+        try:
+            if self._file_size(self.jsonl_path) >= self.max_jsonl_bytes:
+                self.log_file.close()
+                self.jsonl_index += 1
+                self.jsonl_path = self._jsonl_path_for_index(self.jsonl_index)
+                self.log_file = open(self.jsonl_path, "a", encoding="utf-8")
+                print(f"🔁 Rotated JSONL (size) → {self.jsonl_path}")
+        except Exception as e:
+            print(f"[rotation jsonl size] {e}")
+
+    def _maybe_rotate_csv_size(self):
+        if not self.csv_enabled or not self.csv_file or self.max_csv_bytes is None:
+            return
+        try:
+            if self._file_size(self.csv_path) >= self.max_csv_bytes:
+                self.csv_file.close()
+                self.csv_index += 1
+                self.csv_path = self._csv_path_for_index(self.csv_index)
+                self._open_csv_file()
+                print(f"🔁 Rotated CSV (size) → {self.csv_path}")
+        except Exception as e:
+            print(f"[rotation csv size] {e}")
+
+    def connect(self):
+        print(f"🔌 Connecting to Meshtastic over TCP {self.host}:4403 …")
+        self.iface = meshtastic.tcp_interface.TCPInterface(hostname=self.host)
+        pub.subscribe(self.on_packet, "meshtastic.receive")
+        print(f"✅ Connected.\n- JSONL: {self.jsonl_path}")
+        if self.csv_enabled and self.csv_path:
+            pass
+        print()
+
+    def _port_allowed(self, port: Optional[str]) -> bool:
+        if not self.filter_ports:
+            return True
+        if port is None:
+            return False
+        return str(port).upper() in self.filter_ports
+
+    def on_packet(self, packet=None, interface=None, **kwargs):
+        try:
+            if packet is None:
+                return
+
+            # Daily rotation check first (so new-day records go to new file)
+            self._maybe_rotate_daily_jsonl()
+            self._maybe_rotate_daily_csv()
+
+            p_norm = ensure_dict(packet)
+
+            wrapped = {
+                "schema_version": SCHEMA_VERSION,
+                "timestamp": (self._now()).isoformat(),
+                "packet": jsonable(packet)
+            }
+            self.log_file.write(json.dumps(wrapped, ensure_ascii=False) + "\n")
+            self.log_file.flush()
+
+            # Size rotation checks
+            self._maybe_rotate_jsonl_size()
+
+            decoded = _asdict(p_norm.get("decoded", {}))
+            port = decoded.get("portnum")
+            port_str = str(port) if port is not None else None
+
+            if self._port_allowed(port_str):
+                if self.csv_enabled:
+                    row = extract_csv_row(p_norm)
+                    self.csv_writer.writerow(row)
+                    self.csv_file.flush()
+                    self._maybe_rotate_csv_size()
+
+                print(f"[{wrapped['timestamp']}] port={port_str} from={p_norm.get('fromId') or p_norm.get('from')} to={p_norm.get('toId')}")
+                if port_str == "TELEMETRY_APP":
+                    telem = _asdict(decoded.get("telemetry", {}))
+                    dev = _asdict(telem.get("deviceMetrics", {}))
+                    env = _asdict(telem.get("environmentMetrics", {}))
+                    hum = env.get("humidity", env.get("relativeHumidity"))
+                    print(f"  TELEM: Batt={dev.get('batteryLevel')}% V={dev.get('voltage')}V "
+                          f"Temp={env.get('temperature')}°C Hum={hum}% Press={env.get('barometricPressure')}hPa")
+                elif port_str == "POSITION_APP":
+                    pos = _asdict(decoded.get("position", {}))
+                    print(f"  POS: lat={pos.get('latitude')} lon={pos.get('longitude')} alt={pos.get('altitude')}")
+                elif port_str == "NODEINFO_APP":
+                    user = _asdict(decoded.get("user", {}))
+                    print(f"  NODE: {user.get('longName')} ({user.get('shortName')}) {user.get('hwModel')} id={user.get('id')}")
+                elif port_str == "WAYPOINT_APP":
+                    w = _extract_waypoint_fields(p_norm)
+                    print(f"  WPT: id={w.get('waypointId')} name={w.get('waypointName')} "
+                          f"lat={w.get('waypointLat')} lon={w.get('waypointLon')} "
+                          f"expireISO={w.get('waypointExpireISO')}")
+                    if self.csv_enabled:
+                        print("  ↳ waypoint fields written to CSV")
+        except Exception as e:
+            print(f"[on_packet error] {e}")
+
+    def run(self, duration: int = 0):
+        start = time.time()
+        while True:
+            time.sleep(0.1)
+            if duration and (time.time() - start > duration):
+                break
+
+    def close(self):
+        print("🔚 Closing connection…")
+        try:
+            if self.iface:
+                self.iface.close()
+        except Exception:
+            pass
+        try:
+            self.log_file.close()
+        except Exception:
+            pass
+        if self.csv_enabled:
+            try:
+                self.csv_file.close()
+            except Exception:
+                pass
+        print("✅ Done.")
+
+# ---------------- CLI ----------------
+
+def main():
+    parser = argparse.ArgumentParser(description="Meshtastic TCP debug listener with JSONL + CSV (+telemetry layout).")
+    parser.add_argument("--host", required=True, help="Node IP or hostname (default node port 4403)")
+    parser.add_argument("--seconds", type=int, default=0, help="Run duration (0 = infinite)")
+    parser.add_argument("--outdir", default="mesh_debug_logs", help="Output folder")
+    parser.add_argument("--csv", action="store_true", help="Also write a flattened CSV alongside JSONL")
+    parser.add_argument("--max-jsonl-mb", type=int, default=100, help="Rotate JSONL when size exceeds this many MB (default 100)")
+    parser.add_argument("--max-csv-mb", type=int, default=100, help="Rotate CSV when size exceeds this many MB (default 100)")
+    parser.add_argument("--filter-port", default="", help="Comma-separated portnums to include in CSV/console (e.g. POSITION_APP,TELEMETRY_APP). JSONL always logs all.")
+    parser.add_argument("--rotate-daily", action="store_true", help="Rotate files when the date changes (UTC by default).")
+    parser.add_argument("--daily-local", action="store_true", help="Use local time for --rotate-daily (else UTC).")
+
+    args = parser.parse_args()
+    filter_ports = [p.strip() for p in args.filter_port.split(",")] if args.filter_port else []
+
+    logger = MeshtasticDebugLogger(
+        args.host,
+        args.outdir,
+        csv_enabled=args.csv,
+        max_jsonl_mb=args.max_jsonl_mb,
+        max_csv_mb=args.max_csv_mb,
+        filter_ports=filter_ports,
+        rotate_daily=args.rotate_daily,
+        use_local_time=args.daily_local
+    )
+
+    try:
+        logger.connect()
+        logger.run(duration=args.seconds)
+    except KeyboardInterrupt:
+        print("\n🛑 Interrupted by user.")
+    except Exception as e:
+        print(f"❌ Error: {e}")
+    finally:
+        logger.close()
+
+if __name__ == "__main__":
+    sys.exit(main())
