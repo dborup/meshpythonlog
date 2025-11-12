@@ -16,12 +16,13 @@ from datetime import datetime, timedelta
 # ---------------- Configuration ----------------
 DEFAULT_DIR = "mesh_debug_logs"
 JSONL_GLOB = "meshtastic_dump_*.jsonl"
-TARGET_NODES = ["!335d6d57", "!dcb05c16", "!11ac3107", "!0bfc8344"]
+TARGET_NODES = ["!335d6d57", "!dcb05c16", "!11ac3107", "!0bfc8344", "!a81c20b7"]
 NODE_NAMES = {
     "!335d6d57": "Drastrup",
     "!dcb05c16": "Øster-Alling",
     "!11ac3107": "Skejby",
     "!0bfc8344": "Skødstrup",
+    "!a81c20b7": "Sønder-Borup",
 }
 
 ALARM_STORE = Path("alarm_rules.json")
